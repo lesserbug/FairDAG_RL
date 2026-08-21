@@ -162,6 +162,13 @@ impl Import for Committee {}
 
 impl Committee {
 
+    pub fn new(authorities: BTreeMap<PublicKey, Authority>) -> Self {
+        Self {
+            authorities,
+            gamma: None,
+        }
+    }
+
     pub fn get_gamma(&mut self) -> Option<f64> {
         self.gamma
     }
