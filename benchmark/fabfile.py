@@ -504,11 +504,13 @@ def remote(ctx, debug=False):
         'faults': 0,
         'arbitragers': 0,
         'attack_type': 0,
-        'nodes': [5],
+        'nodes': [20],
         'workers': 1,
         'collocate': True,
-        # Keep the total offered rates in one explicit sweep list.
-        'rate': [20_000, 40_000, 60_000, 80_000],
+        # Run one point at a time so its raw logs can be archived before the
+        # next run replaces benchmark/logs. For 20 clients, use a multiple of
+        # 20 clients * 20 bursts/s to avoid integer rate truncation.
+        'rate': [800],
         'tx_size': 512,
         'duration': 60,
         'drain_duration': 30,

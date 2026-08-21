@@ -2,7 +2,6 @@
 # Modified for FairDAG-RL v4: FairDAG metrics parsed from worker logs.
 from datetime import datetime
 from glob import glob
-from multiprocessing import Pool
 from os.path import join
 from re import findall, search
 from statistics import mean
@@ -50,8 +49,11 @@ class LogParser:
 
         # Parse the clients logs.
         try:
-            with Pool() as p:
-                results = p.map(self._parse_clients, clients)
+            # Parse in-process: each parser returns sizeable dictionaries and
+            # multiprocessing duplicates them in the parent/worker processes.
+            # At larger committee sizes that can exhaust the benchmark host's
+            # memory without changing the parsing result.
+            results = list(map(self._parse_clients, clients))
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
         self.size, self.rate, self.start, misses, self.sent_samples \
@@ -71,8 +73,7 @@ class LogParser:
 
         # Parse the primaries logs.
         try:
-            with Pool() as p:
-                results = p.map(self._parse_primaries, primaries)
+            results = list(map(self._parse_primaries, primaries))
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
         (proposals, commits, self.configs, primary_ips, blocks_to_heights,
@@ -88,8 +89,7 @@ class LogParser:
 
         # Parse the workers logs.
         try:
-            with Pool() as p:
-                results = p.map(self._parse_workers, workers)
+            results = list(map(self._parse_workers, workers))
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
         sizes, self.received_samples, workers_ips, fair_ordered_txs_list, fair_ordered_seqs_list, fair_graph_stats_list, arrival_times_list, task_timings_list = zip(*results)

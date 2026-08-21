@@ -7,17 +7,6 @@ from benchmark.config import BenchParameters, Committee, ConfigError, NodeParame
 from benchmark.logs import LogParser, ParseError, _to_posix
 
 
-class SequentialPool:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        return False
-
-    def map(self, function, values):
-        return [function(value) for value in values]
-
-
 def client_log(start, samples=(), misses=0):
     lines = [
         'Transactions size: 512 B',
@@ -63,7 +52,6 @@ def worker_log(ip, final_orders=()):
     return '\n'.join(lines)
 
 
-@patch('benchmark.logs.Pool', SequentialPool)
 class FinalOrderLogTests(unittest.TestCase):
     def test_final_order_deduplication_window_and_latency(self):
         clients = [
