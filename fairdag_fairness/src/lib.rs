@@ -32,8 +32,8 @@
 //       }
 //   }
 //
-// Other features: dense u32 indices, free-list recycling, nibble-packed weights,
-// u32 counted masks (N ≤ 32), missing_pairs optimization, FAIRDAG_PERF logging.
+// Other features: dense u32 indices, free-list recycling, compact unresolved-pair
+// state (N ≤ 32), missing_pairs optimization, FAIRDAG_PERF logging.
 
 use crypto::PublicKey;
 use log::{info, warn};
@@ -54,8 +54,7 @@ pub type OrderingEntry = (TxDigest, u64);
 // Constants
 // =============================================================================
 
-const NONE_LOCAL: u16 = u16::MAX;
-const INITIAL_GRAPH_CAPACITY: usize = 16_384;
+const NONE_LOCAL: u32 = u32::MAX;
 
 // =============================================================================
 // CommittedVertex / CommittedSubdag
@@ -87,38 +86,6 @@ pub enum NodeType {
 }
 
 // =============================================================================
-// Nibble-packed weight helpers
-// =============================================================================
-
-#[inline(always)]
-fn get_weight(packed: &[u8], idx: usize) -> u8 {
-    let b = packed[idx >> 1];
-    if idx & 1 == 0 { b & 0x0F } else { b >> 4 }
-}
-
-#[inline(always)]
-fn set_weight(packed: &mut [u8], idx: usize, value: u8) {
-    let bi = idx >> 1;
-    if idx & 1 == 0 {
-        packed[bi] = (packed[bi] & 0xF0) | (value & 0x0F);
-    } else {
-        packed[bi] = (packed[bi] & 0x0F) | (value << 4);
-    }
-}
-
-#[inline(always)]
-fn inc_weight(packed: &mut [u8], idx: usize) {
-    let bi = idx >> 1;
-    if idx & 1 == 0 {
-        let low = packed[bi] & 0x0F;
-        if low < 15 { packed[bi] += 1; }
-    } else {
-        let high = packed[bi] >> 4;
-        if high < 15 { packed[bi] += 0x10; }
-    }
-}
-
-// =============================================================================
 // Bitset helpers
 // =============================================================================
 
@@ -133,18 +100,16 @@ fn bit_set(bits: &mut [u64], idx: usize) {
 }
 
 // =============================================================================
-// Index helpers
+// Index helper for an unordered pair. Column-major triangular indexing keeps
+// existing indices stable while a graph grows.
 // =============================================================================
 
 #[inline(always)]
-fn w_idx(i: u16, j: u16, cap: usize) -> usize {
-    (i as usize) * cap + (j as usize)
-}
-
-#[inline(always)]
-fn pair_idx(i: u16, j: u16, cap: usize) -> usize {
+fn pair_idx(i: u32, j: u32) -> usize {
     let (a, b) = if i < j { (i, j) } else { (j, i) };
-    (a as usize) * cap + (b as usize)
+    let a = a as usize;
+    let b = b as usize;
+    b * (b - 1) / 2 + a
 }
 
 // =============================================================================
@@ -186,38 +151,66 @@ impl TransactionNode {
 // DependencyGraph
 // =============================================================================
 
+#[derive(Clone, Copy, Debug)]
+pub struct MissingPair {
+    low: u32,
+    high: u32,
+    counted_mask: u32,
+    low_to_high: u8,
+    high_to_low: u8,
+}
+
+impl MissingPair {
+    fn new(
+        first: u32,
+        second: u32,
+        first_to_second: usize,
+        second_to_first: usize,
+        counted_mask: u32,
+    ) -> Self {
+        if first < second {
+            MissingPair {
+                low: first,
+                high: second,
+                counted_mask,
+                low_to_high: first_to_second as u8,
+                high_to_low: second_to_first as u8,
+            }
+        } else {
+            MissingPair {
+                low: second,
+                high: first,
+                counted_mask,
+                low_to_high: second_to_first as u8,
+                high_to_low: first_to_second as u8,
+            }
+        }
+    }
+}
+
 pub struct DependencyGraph {
     pub round: Round,
     pub node_count: usize,
-    pub capacity: usize,
     pub local_to_global: Vec<u32>,
-    pub global_to_local: Vec<u16>,
-    pub weight: Vec<u8>,
-    pub edges: Vec<Vec<u16>>,
+    pub global_to_local: Vec<u32>,
+    pub edges: Vec<Vec<u32>>,
     pub edge_pair_count: usize,
     pub has_edge_pair: Vec<u64>,
-    pub counted: Vec<u32>,
-    pub missing_pairs: Vec<(u16, u16)>,
+    pub missing_pairs: Vec<MissingPair>,
     pub finalized: bool,
     pub final_order: Vec<TxDigest>,
 }
 
 impl DependencyGraph {
-    fn new(round: Round, capacity: usize) -> Self {
-        let cap = capacity;
-        let nibble_bytes = (cap * cap + 1) / 2;
-        let bit_words = (cap * cap + 63) / 64;
+    fn new(round: Round) -> Self {
         DependencyGraph {
             round,
             node_count: 0,
-            capacity: cap,
-            local_to_global: Vec::with_capacity(cap),
+            local_to_global: Vec::new(),
             global_to_local: Vec::new(),
-            weight: vec![0u8; nibble_bytes],
-            edges: (0..cap).map(|_| Vec::with_capacity(16)).collect(),
+            edges: Vec::new(),
             edge_pair_count: 0,
-            has_edge_pair: vec![0u64; bit_words],
-            counted: vec![0u32; cap * cap],
+            has_edge_pair: Vec::new(),
             missing_pairs: Vec::new(),
             finalized: false,
             final_order: Vec::new(),
@@ -232,24 +225,27 @@ impl DependencyGraph {
         }
     }
 
-    fn add_node(&mut self, global_dense_idx: u32) -> u16 {
+    fn add_node(&mut self, global_dense_idx: u32) -> u32 {
         self.ensure_global_capacity(global_dense_idx);
         let existing = self.global_to_local[global_dense_idx as usize];
         if existing != NONE_LOCAL { return existing; }
-        let local_idx = self.node_count as u16;
-        assert!(
-            (local_idx as usize) < self.capacity,
-            "FATAL: DependencyGraph capacity {} exceeded at node_count={}.",
-            self.capacity, self.node_count
-        );
+        let local_idx = u32::try_from(self.node_count)
+            .expect("FATAL: DependencyGraph contains more than u32::MAX nodes");
         self.local_to_global.push(global_dense_idx);
         self.global_to_local[global_dense_idx as usize] = local_idx;
+        self.edges.push(Vec::with_capacity(16));
         self.node_count += 1;
+
+        let pair_count = self.node_count * self.node_count.saturating_sub(1) / 2;
+        let bit_words = (pair_count + 63) / 64;
+        if bit_words > self.has_edge_pair.len() {
+            self.has_edge_pair.resize(bit_words, 0);
+        }
         local_idx
     }
 
     #[inline]
-    fn get_local(&self, global_dense_idx: u32) -> Option<u16> {
+    fn get_local(&self, global_dense_idx: u32) -> Option<u32> {
         let g = global_dense_idx as usize;
         if g < self.global_to_local.len() {
             let l = self.global_to_local[g];
@@ -265,12 +261,12 @@ impl DependencyGraph {
     }
 
     #[inline]
-    fn has_edge(&self, li: u16, lj: u16) -> bool {
-        bit_get(&self.has_edge_pair, pair_idx(li, lj, self.capacity))
+    fn has_edge(&self, li: u32, lj: u32) -> bool {
+        bit_get(&self.has_edge_pair, pair_idx(li, lj))
     }
 
-    fn add_edge(&mut self, from: u16, to: u16) -> bool {
-        let pidx = pair_idx(from, to, self.capacity);
+    fn add_edge(&mut self, from: u32, to: u32) -> bool {
+        let pidx = pair_idx(from, to);
         if bit_get(&self.has_edge_pair, pidx) { return false; }
         bit_set(&mut self.has_edge_pair, pidx);
         self.edge_pair_count += 1;
@@ -278,23 +274,8 @@ impl DependencyGraph {
         true
     }
 
-    #[inline]
-    fn get_weight_val(&self, li: u16, lj: u16) -> u8 {
-        get_weight(&self.weight, w_idx(li, lj, self.capacity))
-    }
-    #[inline]
-    fn set_weight_val(&mut self, li: u16, lj: u16, val: u8) {
-        set_weight(&mut self.weight, w_idx(li, lj, self.capacity), val);
-    }
-    #[inline]
-    fn inc_weight_val(&mut self, li: u16, lj: u16) {
-        inc_weight(&mut self.weight, w_idx(li, lj, self.capacity));
-    }
-
     fn release_memory(&mut self) {
-        self.weight = Vec::new();
         self.has_edge_pair = Vec::new();
-        self.counted = Vec::new();
         self.missing_pairs = Vec::new();
         for e in &mut self.edges { *e = Vec::new(); }
         self.edges = Vec::new();
@@ -607,7 +588,7 @@ impl FairnessLayer {
 
         // Create graph
         let graph_idx = self.graphs.len();
-        self.graphs.push(DependencyGraph::new(r, INITIAL_GRAPH_CAPACITY));
+        self.graphs.push(DependencyGraph::new(r));
         self.round_to_graph.insert(r, graph_idx);
 
         // Process pending readd from prior finalizations
@@ -732,7 +713,7 @@ impl FairnessLayer {
             for li in 0..node_count {
                 let d2_dense = self.graphs[graph_idx].local_to_global[li];
                 if d2_dense == d_dense { continue; }
-                let d2_local = li as u16;
+                let d2_local = li as u32;
 
                 if newly_set.contains(&d2_dense) && d_dense > d2_dense {
                     continue;
@@ -740,9 +721,6 @@ impl FairnessLayer {
 
                 let (w12, w21) = self.calculate_pairwise_weight(d_dense, d2_dense);
                 weights_computed += 1;
-
-                self.graphs[graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
-                self.graphs[graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
 
                 let mut mask: u32 = 0;
                 for r in 0..n {
@@ -752,9 +730,6 @@ impl FairnessLayer {
                         mask |= 1u32 << r;
                     }
                 }
-                let pidx = pair_idx(d_local, d2_local, self.graphs[graph_idx].capacity);
-                self.graphs[graph_idx].counted[pidx] = mask;
-
                 if w12 >= ht || w21 >= ht {
                     if w12 >= w21 {
                         self.graphs[graph_idx].add_edge(d_local, d2_local);
@@ -763,12 +738,9 @@ impl FairnessLayer {
                     }
                     edges_added += 1;
                 } else {
-                    let (lmin, lmax) = if d_local < d2_local {
-                        (d_local, d2_local)
-                    } else {
-                        (d2_local, d_local)
-                    };
-                    self.graphs[graph_idx].missing_pairs.push((lmin, lmax));
+                    self.graphs[graph_idx].missing_pairs.push(MissingPair::new(
+                        d_local, d2_local, w12, w21, mask,
+                    ));
                     missing_added += 1;
                 }
             }
@@ -794,51 +766,45 @@ impl FairnessLayer {
                 continue;
             }
 
-            let cap = self.graphs[g_idx].capacity;
             let num_missing = self.graphs[g_idx].missing_pairs.len();
             let mut resolved: Vec<usize> = Vec::new();
 
             for pair_pos in 0..num_missing {
-                let (li, lj) = self.graphs[g_idx].missing_pairs[pair_pos];
+                let mut pair = self.graphs[g_idx].missing_pairs[pair_pos];
 
-                if self.graphs[g_idx].has_edge(li, lj) {
+                if self.graphs[g_idx].has_edge(pair.low, pair.high) {
                     resolved.push(pair_pos);
                     continue;
                 }
 
                 stat_checked += 1;
 
-                let di = self.graphs[g_idx].local_to_global[li as usize];
-                let dj = self.graphs[g_idx].local_to_global[lj as usize];
-                let pidx = pair_idx(li, lj, cap);
-                let mut counted_mask = self.graphs[g_idx].counted[pidx];
+                let di = self.graphs[g_idx].local_to_global[pair.low as usize];
+                let dj = self.graphs[g_idx].local_to_global[pair.high as usize];
 
                 for r in 0..n {
-                    if counted_mask & (1u32 << r) != 0 { continue; }
+                    if pair.counted_mask & (1u32 << r) != 0 { continue; }
                     if let (Some(oi_i), Some(oi_j)) = (
                         self.nodes[di as usize].committed_ois[r],
                         self.nodes[dj as usize].committed_ois[r],
                     ) {
-                        counted_mask |= 1u32 << r;
+                        pair.counted_mask |= 1u32 << r;
                         if oi_i < oi_j {
-                            self.graphs[g_idx].inc_weight_val(li, lj);
+                            pair.low_to_high += 1;
                         } else {
-                            self.graphs[g_idx].inc_weight_val(lj, li);
+                            pair.high_to_low += 1;
                         }
                         stat_incr += 1;
                     }
                 }
 
-                self.graphs[g_idx].counted[pidx] = counted_mask;
+                self.graphs[g_idx].missing_pairs[pair_pos] = pair;
 
-                let w_fwd = self.graphs[g_idx].get_weight_val(li, lj);
-                let w_rev = self.graphs[g_idx].get_weight_val(lj, li);
-
-                if w_fwd >= ht || w_rev >= ht {
-                    if w_fwd >= w_rev {
-                        self.graphs[g_idx].add_edge(li, lj);
+                if pair.low_to_high >= ht || pair.high_to_low >= ht {
+                    if pair.low_to_high >= pair.high_to_low {
+                        self.graphs[g_idx].add_edge(pair.low, pair.high);
                     } else {
-                        self.graphs[g_idx].add_edge(lj, li);
+                        self.graphs[g_idx].add_edge(pair.high, pair.low);
                     }
                     resolved.push(pair_pos);
                     stat_resolved += 1;
@@ -1023,17 +989,13 @@ impl FairnessLayer {
             let d_local = self.graphs[target_graph_idx].add_node(dense);
 
             let node_count = self.graphs[target_graph_idx].node_count;
-            let cap = self.graphs[target_graph_idx].capacity;
 
             for li in 0..node_count {
                 let d2_dense = self.graphs[target_graph_idx].local_to_global[li];
                 if d2_dense == dense { continue; }
-                let d2_local = li as u16;
+                let d2_local = li as u32;
 
                 let (w12, w21) = self.calculate_pairwise_weight(dense, d2_dense);
-
-                self.graphs[target_graph_idx].set_weight_val(d_local, d2_local, w12 as u8);
-                self.graphs[target_graph_idx].set_weight_val(d2_local, d_local, w21 as u8);
 
                 let mut mask: u32 = 0;
                 for r in 0..n {
@@ -1043,9 +1005,6 @@ impl FairnessLayer {
                         mask |= 1u32 << r;
                     }
                 }
-                let pidx = pair_idx(d_local, d2_local, cap);
-                self.graphs[target_graph_idx].counted[pidx] = mask;
-
                 if w12 >= ht || w21 >= ht {
                     if !self.graphs[target_graph_idx].has_edge(d_local, d2_local) {
                         if w12 >= w21 {
@@ -1055,12 +1014,9 @@ impl FairnessLayer {
                         }
                     }
                 } else {
-                    let (lmin, lmax) = if d_local < d2_local {
-                        (d_local, d2_local)
-                    } else {
-                        (d2_local, d_local)
-                    };
-                    self.graphs[target_graph_idx].missing_pairs.push((lmin, lmax));
+                    self.graphs[target_graph_idx].missing_pairs.push(MissingPair::new(
+                        d_local, d2_local, w12, w21, mask,
+                    ));
                 }
             }
         }
@@ -1120,18 +1076,18 @@ impl FairnessLayer {
 // Tarjan's SCC
 // =============================================================================
 
-fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
+fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u32>]) -> Vec<Vec<u32>> {
     let mut dfn = vec![0i32; node_count];
     let mut low = vec![0i32; node_count];
     let mut on_stack = vec![false; node_count];
-    let mut stack: Vec<u16> = Vec::with_capacity(node_count);
-    let mut sccs: Vec<Vec<u16>> = Vec::new();
+    let mut stack: Vec<u32> = Vec::with_capacity(node_count);
+    let mut sccs: Vec<Vec<u32>> = Vec::new();
     let mut index_counter: i32 = 0;
 
     for start in 0..node_count {
         if dfn[start] != 0 { continue; }
-        let mut dfs_stack: Vec<(u16, usize)> = Vec::new();
-        let u = start as u16;
+        let mut dfs_stack: Vec<(u32, usize)> = Vec::new();
+        let u = start as u32;
         index_counter += 1;
         dfn[start] = index_counter;
         low[start] = index_counter;
@@ -1157,7 +1113,7 @@ fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
                 }
             } else {
                 if low[v_usize] == dfn[v_usize] {
-                    let mut scc: Vec<u16> = Vec::new();
+                    let mut scc: Vec<u32> = Vec::new();
                     loop {
                         let w = stack.pop().unwrap();
                         on_stack[w as usize] = false;
@@ -1186,7 +1142,7 @@ fn tarjan_scc_dense(node_count: usize, edges: &[Vec<u16>]) -> Vec<Vec<u16>> {
 // =============================================================================
 
 fn topological_sort_sccs_dense(
-    sccs: &[Vec<u16>], edges: &[Vec<u16>], node_count: usize,
+    sccs: &[Vec<u32>], edges: &[Vec<u32>], node_count: usize,
 ) -> Vec<usize> {
     let mut node_to_scc = vec![0usize; node_count];
     for (scc_idx, scc) in sccs.iter().enumerate() {
@@ -1232,14 +1188,14 @@ fn topological_sort_sccs_dense(
 // Hamiltonian Path
 // =============================================================================
 
-fn hamiltonian_path_dense(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
+fn hamiltonian_path_dense(scc: &[u32], edges: &[Vec<u32>]) -> Vec<u32> {
     if scc.len() <= 1 { return scc.to_vec(); }
 
-    let has_edge = |u: u16, v: u16| -> bool { edges[u as usize].contains(&v) };
+    let has_edge = |u: u32, v: u32| -> bool { edges[u as usize].contains(&v) };
     let mut sorted = scc.to_vec();
     sorted.sort_unstable();
 
-    let mut path: VecDeque<u16> = VecDeque::new();
+    let mut path: VecDeque<u32> = VecDeque::new();
     path.push_back(sorted[0]);
 
     for &v in &sorted[1..] {
@@ -1262,4 +1218,70 @@ fn hamiltonian_path_dense(scc: &[u16], edges: &[Vec<u16>]) -> Vec<u16> {
         }
     }
     path.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_graph_grows_past_the_old_fixed_limit() {
+        const OLD_FIXED_LIMIT: u32 = 16_384;
+        let mut graph = DependencyGraph::new(7);
+
+        for dense in 0..=OLD_FIXED_LIMIT {
+            assert_eq!(graph.add_node(dense), dense);
+        }
+
+        assert_eq!(graph.node_count, OLD_FIXED_LIMIT as usize + 1);
+        assert_eq!(graph.get_local(OLD_FIXED_LIMIT), Some(OLD_FIXED_LIMIT));
+        assert_eq!(graph.edges.len(), graph.node_count);
+    }
+
+    #[test]
+    fn pair_index_and_existing_edges_survive_graph_growth() {
+        let mut graph = DependencyGraph::new(9);
+        let first = graph.add_node(10);
+        let second = graph.add_node(11);
+        assert!(graph.add_edge(first, second));
+
+        for dense in 12..20_000 {
+            graph.add_node(dense);
+        }
+
+        assert!(graph.has_edge(first, second));
+        assert!(!graph.add_edge(second, first));
+        assert_eq!(graph.edge_pair_count, 1);
+    }
+
+    #[test]
+    fn unresolved_pair_keeps_weights_until_later_observation_resolves_it() {
+        let keys: Vec<PublicKey> = (0u8..5).map(|i| PublicKey([i; 32])).collect();
+        let mut layer = FairnessLayer::new(keys, 1, 1.0);
+        let first_dense = layer.get_or_create_dense(100);
+        let second_dense = layer.get_or_create_dense(200);
+
+        layer.nodes[first_dense as usize].committed_ois[0] = Some(1);
+        layer.nodes[second_dense as usize].committed_ois[0] = Some(2);
+
+        let mut graph = DependencyGraph::new(11);
+        let first_local = graph.add_node(first_dense);
+        let second_local = graph.add_node(second_dense);
+        graph.missing_pairs.push(MissingPair::new(
+            first_local,
+            second_local,
+            1,
+            0,
+            1,
+        ));
+        layer.graphs.push(graph);
+
+        layer.nodes[first_dense as usize].committed_ois[1] = Some(3);
+        layer.nodes[second_dense as usize].committed_ois[1] = Some(4);
+
+        assert_eq!(layer.update_weights_and_edges(), (1, 1, 1));
+        assert!(layer.graphs[0].missing_pairs.is_empty());
+        assert!(layer.graphs[0].has_edge(first_local, second_local));
+        assert_eq!(layer.graphs[0].edges[first_local as usize], vec![second_local]);
+    }
 }
