@@ -24,8 +24,8 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 
 // Fixture
 pub fn committee() -> Committee {
-    Committee {
-        authorities: keys()
+    let mut committee = Committee::new(
+        keys()
             .iter()
             .enumerate()
             .map(|(i, (id, _))| {
@@ -47,6 +47,7 @@ pub fn committee() -> Committee {
                 (
                     *id,
                     Authority {
+                        attack_type: 0,
                         stake: 1,
                         primary,
                         workers,
@@ -54,7 +55,9 @@ pub fn committee() -> Committee {
                 )
             })
             .collect(),
-    }
+    );
+    committee.set_gamma(1.0);
+    committee
 }
 
 // Fixture.
@@ -90,12 +93,12 @@ pub fn transaction() -> Transaction {
 
 // Fixture
 pub fn batch() -> Batch {
-    vec![transaction(), transaction()]
+    vec![(transaction(), 1), (transaction(), 1)]
 }
 
 // Fixture
 pub fn serialized_batch() -> Vec<u8> {
-    let message = WorkerMessage::Batch(batch());
+    let message = WorkerMessage::Batch(batch(), Vec::new());
     bincode::serialize(&message).unwrap()
 }
 

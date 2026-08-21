@@ -185,14 +185,12 @@ impl FairDagProcessor {
                     Ok(Some(serialized_batch)) => {
                         batches_found += 1;
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            // FairDAG-RL: Updated pattern to match new Batch variant
-                            // with indirect entries. We only use the direct entries
-                            // for ordering — indirect entries are informational.
-                            Ok(WorkerMessage::Batch(batch_entries, _indirect_entries)) => {
-                                for (tx_bytes, oi) in batch_entries {
-                                    let tx_id = extract_tx_digest(&tx_bytes);
-                                    ordering_entries.push((tx_id, oi));
-                                }
+                            Ok(WorkerMessage::Batch(batch_entries, indirect_entries)) => {
+                                append_batch_ordering_entries(
+                                    &mut ordering_entries,
+                                    batch_entries,
+                                    indirect_entries,
+                                );
                             }
                             Ok(_) => {
                                 warn!("Unexpected message type for batch {:?}", batch_digest);
@@ -230,5 +228,49 @@ impl FairDagProcessor {
             leader_round,
             vertices,
         }
+    }
+}
+
+/// Add every local-order observation carried by a committed worker batch.
+///
+/// Direct entries contain the full transaction, while indirect entries contain
+/// the transaction id and the local OI assigned by the certificate author's
+/// worker. FairDAG needs both forms to count observations across replicas.
+fn append_batch_ordering_entries(
+    ordering_entries: &mut Vec<(TxDigest, u64)>,
+    direct_entries: Vec<(Vec<u8>, u64)>,
+    indirect_entries: Vec<(TxDigest, u64)>,
+) {
+    ordering_entries.extend(
+        direct_entries
+            .into_iter()
+            .map(|(tx_bytes, oi)| (extract_tx_digest(&tx_bytes), oi)),
+    );
+    ordering_entries.extend(indirect_entries);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_batch_ordering_entries;
+
+    #[test]
+    fn committed_batch_keeps_direct_and_indirect_local_orders() {
+        let direct_tx_id: u64 = 0x0102_0304_0506_0708;
+        let mut direct_tx = vec![0u8];
+        direct_tx.extend_from_slice(&direct_tx_id.to_be_bytes());
+
+        let indirect_tx_id: u64 = 0x1112_1314_1516_1718;
+        let mut ordering_entries = Vec::new();
+
+        append_batch_ordering_entries(
+            &mut ordering_entries,
+            vec![(direct_tx, 7)],
+            vec![(indirect_tx_id, 11)],
+        );
+
+        assert_eq!(
+            ordering_entries,
+            vec![(direct_tx_id, 7), (indirect_tx_id, 11)]
+        );
     }
 }
