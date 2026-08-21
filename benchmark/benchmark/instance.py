@@ -108,18 +108,28 @@ class InstanceManager:
         )
 
     def _get_ami(self, client):
-        # The AMI changes with regions.
-        response = client.describe_images(
-            Filters=[
-                {
-                    "Name": "description",
-                    "Values": [
-                        "Canonical, Ubuntu, 22.04 LTS, amd64 jammy image build on 2023-09-19"
-                    ],
-                }
-            ]
-        )
-        return response["Images"][0]["ImageId"]
+    	response = client.describe_images(
+        	Owners=["099720109477"],
+        	Filters=[
+            	{
+                	"Name": "name",
+                	"Values": [
+                    	"ubuntu/images/hvm-ssd/"
+                    	"ubuntu-jammy-22.04-amd64-server-*"
+                	],
+            	},
+            	{"Name": "state", "Values": ["available"]},
+            	{"Name": "architecture", "Values": ["x86_64"]},
+            	{"Name": "root-device-type", "Values": ["ebs"]},
+            	{"Name": "virtualization-type", "Values": ["hvm"]},
+        	],
+    	)
+    	images = response.get("Images", [])
+    	if not images:
+        	raise BenchError(
+            	"Failed to find an official Ubuntu 22.04 AMD64 AMI"
+        	)
+    	return max(images, key=lambda image: image["CreationDate"])["ImageId"]
 
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0
