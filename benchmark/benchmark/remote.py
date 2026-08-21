@@ -70,8 +70,16 @@ class Bench:
             # This is missing from the Rocksdb installer (needed for Rocksdb).
             'sudo apt-get install -y clang',
 
-            # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+            # Clone into the configured directory and select the configured branch.
+            (
+                f'if test -d {self.settings.repo_name}/.git; then '
+                f'(cd {self.settings.repo_name} '
+                f'&& git fetch -f origin {self.settings.branch} '
+                f'&& git checkout -f {self.settings.branch} '
+                f'&& git pull --ff-only origin {self.settings.branch}); '
+                f'else git clone --branch {self.settings.branch} --single-branch '
+                f'{self.settings.repo_url} {self.settings.repo_name}; fi'
+            )
         ]
         hosts = self.manager.hosts(flat=True)
         try:
@@ -91,6 +99,20 @@ class Bench:
         try:
             g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=True)
+        except GroupException as e:
+            raise BenchError('Failed to kill nodes', FabricError(e))
+
+    def _kill_clients(self, hosts):
+        try:
+            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g.run(f'({CommandMaker.kill_clients()} || true)', hide=True)
+        except GroupException as e:
+            raise BenchError('Failed to kill clients', FabricError(e))
+
+    def _kill_nodes(self, hosts):
+        try:
+            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g.run(f'({CommandMaker.kill_nodes()} || true)', hide=True)
         except GroupException as e:
             raise BenchError('Failed to kill nodes', FabricError(e))
 
@@ -146,9 +168,9 @@ class Bench:
             f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
         )
         cmd = [
-            f'(cd {self.settings.repo_name} && git fetch -f)',
+            f'(cd {self.settings.repo_name} && git fetch -f origin {self.settings.branch})',
             f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
-            f'(cd {self.settings.repo_name} && git pull -f)',
+            f'(cd {self.settings.repo_name} && git pull --ff-only origin {self.settings.branch})',
             'source $HOME/.cargo/env',
             f'(cd {self.settings.repo_name}/node && {CommandMaker.compile()})',
             CommandMaker.alias_binaries(
@@ -223,6 +245,7 @@ class Bench:
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
         rate_share = ceil(rate / committee.workers())
+        client_id = 0
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
@@ -230,10 +253,12 @@ class Bench:
                     address,
                     bench_parameters.tx_size,
                     rate_share,
-                    [x for y in workers_addresses for _, x in y]
+                    [x for y in workers_addresses for _, x in y],
+                    client_id,
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
+                client_id += 1
 
         # Run the primaries (except the faulty ones).
         Print.info('Booting primaries...')
@@ -269,14 +294,26 @@ class Bench:
         duration = bench_parameters.duration
         for _ in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
             sleep(ceil(duration / 20))
-        self.kill(hosts=hosts, delete_logs=False)
 
-    def _logs(self, committee, faults):
+        Print.info('Stopping clients and draining the system...')
+        self._kill_clients(hosts)
+        drain_duration = bench_parameters.drain_duration
+        if drain_duration > 0:
+            sleep(drain_duration)
+        else:
+            Print.warn(
+                'drain_duration is 0; FairDAG final ordering may be right-censored'
+            )
+
+        self._kill_nodes(hosts)
+
+    def _logs(self, committee, bench_parameters, input_rate):
         # Delete local logs (if any).
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
 
         # Download log files.
+        faults = bench_parameters.faults
         workers_addresses = committee.workers_addresses(faults)
         progress = progress_bar(workers_addresses, prefix='Downloading workers logs:')
         for i, addresses in enumerate(progress):
@@ -304,7 +341,13 @@ class Bench:
 
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
-        return LogParser.process(PathMaker.logs_path(), faults=faults)
+        return LogParser.process(
+            PathMaker.logs_path(),
+            attack_type=bench_parameters.attack_type,
+            arbitragers=bench_parameters.arbitragers,
+            faults=faults,
+            input_rate=input_rate,
+        )
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
@@ -354,7 +397,7 @@ class Bench:
                         )
 
                         faults = bench_parameters.faults
-                        logger = self._logs(committee_copy, faults)
+                        logger = self._logs(committee_copy, bench_parameters, r)
                         logger.print(PathMaker.result_file(
                             faults,
                             n, 

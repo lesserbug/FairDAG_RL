@@ -59,14 +59,18 @@ class CommandMaker:
                 f'--store {store} --parameters {parameters} --is_byzantine {is_byzantine} worker --id {id}')
 
     @staticmethod
-    def run_client(address, size, rate, nodes):
+    def run_client(address, size, rate, nodes, client_id):
         assert isinstance(address, str)
         assert isinstance(size, int) and size > 0
         assert isinstance(rate, int) and rate >= 0
         assert isinstance(nodes, list)
         assert all(isinstance(x, str) for x in nodes)
+        assert isinstance(client_id, int) and client_id >= 0
         nodes = f'--nodes {" ".join(nodes)}' if nodes else ''
-        return f'./benchmark_client {address} --size {size} --rate {rate} {nodes}'
+        return (
+            f'./benchmark_client {address} --size {size} --rate {rate} '
+            f'--client-id {client_id} {nodes}'
+        )
     
     # Themis
     @staticmethod
@@ -185,6 +189,22 @@ class CommandMaker:
     @staticmethod
     def kill():
         return 'tmux kill-server'
+
+    @staticmethod
+    def kill_clients():
+        return (
+            "tmux list-sessions -F '#S' 2>/dev/null "
+            "| grep '^client-' "
+            "| xargs -r -n1 tmux kill-session -t"
+        )
+
+    @staticmethod
+    def kill_nodes():
+        return (
+            "tmux list-sessions -F '#S' 2>/dev/null "
+            "| grep -E '^(primary|worker)-' "
+            "| xargs -r -n1 tmux kill-session -t"
+        )
 
     @staticmethod
     def alias_binaries(origin):

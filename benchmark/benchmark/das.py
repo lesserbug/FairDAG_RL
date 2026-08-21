@@ -216,6 +216,7 @@ class DASBench:
                     self.tx_size,
                     rate_share,
                     worker_list,
+                    i,
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 print(f"Launching client on {clients_hostnames[i // 4]}")

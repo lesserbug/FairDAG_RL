@@ -8,7 +8,6 @@ use futures::future::join_all;
 use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::seq::SliceRandom;
-use rand::Rng;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -25,6 +24,7 @@ async fn main() -> Result<()> {
         .args_from_usage("<ADDRS> 'The network addresses of the nodes where to send txs, comma separated with no spaces'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
+        .args_from_usage("--client-id=<INT> 'Stable benchmark client index used to namespace transaction ids'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
@@ -49,6 +49,11 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<u64>()
         .context("The rate of transactions must be a non-negative integer")?;
+    let client_id = matches
+        .value_of("client-id")
+        .unwrap()
+        .parse::<u64>()
+        .context("The client id must be a non-negative integer")?;
     let nodes = matches
         .values_of("nodes")
         .unwrap_or_default()
@@ -68,6 +73,7 @@ async fn main() -> Result<()> {
         targets,
         size,
         rate,
+        client_id,
         nodes,
     };
 
@@ -82,7 +88,25 @@ struct Client {
     targets: Vec<SocketAddr>,
     size: usize,
     rate: u64,
+    client_id: u64,
     nodes: Vec<SocketAddr>,
+}
+
+const CLIENT_ID_BITS: u32 = 16;
+const TX_SEQUENCE_BITS: u32 = u64::BITS - CLIENT_ID_BITS;
+const MAX_CLIENT_ID: u64 = (1u64 << CLIENT_ID_BITS) - 1;
+const MAX_TX_SEQUENCE: u64 = (1u64 << TX_SEQUENCE_BITS) - 1;
+
+fn transaction_uid(client_id: u64, sequence: u64) -> Result<u64> {
+    if client_id > MAX_CLIENT_ID {
+        return Err(anyhow::Error::msg("Client id exceeds 16-bit namespace"));
+    }
+    if sequence > MAX_TX_SEQUENCE {
+        return Err(anyhow::Error::msg(
+            "Per-client transaction sequence exceeds 48-bit namespace",
+        ));
+    }
+    Ok((client_id << TX_SEQUENCE_BITS) | sequence)
 }
 
 impl Client {
@@ -109,9 +133,8 @@ impl Client {
         let mut rng = rand::thread_rng();
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
-        let starting_counter: u64 = rng.gen();
-        let mut counter = starting_counter; // counter is also random as we send transactions to multiple workers
-        let mut r: u64 = rng.gen();
+        let mut burst_counter = 0u64;
+        let mut sequence = 0u64;
         let mut transports = Vec::with_capacity(streams.len());
 
         for stream in streams {
@@ -129,22 +152,18 @@ impl Client {
             let now = Instant::now();
 
             for x in 0..burst {
-
-                info!("Sending tx");
-
-                if x == (counter - starting_counter) % burst {
+                let tx_id = transaction_uid(self.client_id, sequence)?;
+                if x == burst_counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending transaction {}", counter);
+                    info!("Sending sample transaction {}", tx_id);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(tx_id);
                 } else {
-                    r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
-
-                    info!("Sending transaction {}", r);
+                    tx.put_u64(tx_id);
                 };
+                sequence += 1;
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
@@ -180,7 +199,7 @@ impl Client {
                 // NOTE: This log entry is used to compute performance.
                 warn!("Transaction rate too high for this client");
             }
-            counter += 1;
+            burst_counter += 1;
         }
         Ok(())
     }
@@ -196,5 +215,22 @@ impl Client {
             })
         }))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transaction_uid;
+
+    #[test]
+    fn transaction_ids_are_namespaced_by_client() {
+        assert_ne!(
+            transaction_uid(0, 7).unwrap(),
+            transaction_uid(1, 7).unwrap()
+        );
+        assert_ne!(
+            transaction_uid(1, 7).unwrap(),
+            transaction_uid(1, 8).unwrap()
+        );
     }
 }

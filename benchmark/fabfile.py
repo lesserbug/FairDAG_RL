@@ -50,6 +50,7 @@ def local(ctx, debug=True):
             "rate": 3_000,  # rate: the transaction sending rate
             "tx_size": 512,
             "duration": 60,
+            "drain_duration": 30,
         }
         node_params = {
             "header_size": 1_000,  # bytes
@@ -59,6 +60,9 @@ def local(ctx, debug=True):
             "sync_retry_nodes": 3,  # number of nodes
             "batch_size": 500_000,  # bytes
             "max_batch_delay": 200,  # ms
+            "gamma": 1.0,
+            "scc_ordering": "alphabetical",
+            "fault_threshold": 2,
         }
         try:
             filename = PathMaker.local_result_file(
@@ -497,15 +501,21 @@ def install(ctx):
 def remote(ctx, debug=False):
     ''' Run benchmarks on AWS '''
     bench_params = {
-        'faults': 3,
-        'nodes': [10],
+        'faults': 0,
+        'arbitragers': 0,
+        'attack_type': 0,
+        'nodes': [5],
         'workers': 1,
         'collocate': True,
-        'rate': [10_000, 110_000],
+        # Keep the total offered rates in one explicit sweep list.
+        'rate': [20_000, 40_000, 60_000, 80_000],
         'tx_size': 512,
-        'duration': 300,
-        'runs': 2,
+        'duration': 60,
+        'drain_duration': 30,
+        'runs': 1,
     }
+    gamma = 1.0  # Existing FairDAG default; not benchmark-tuned.
+    k = round(4 / (2 * gamma - 1), 10)
     node_params = {
         'header_size': 1_000,  # bytes
         'max_header_delay': 200,  # ms
@@ -513,7 +523,11 @@ def remote(ctx, debug=False):
         'sync_retry_delay': 10_000,  # ms
         'sync_retry_nodes': 3,  # number of nodes
         'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200  # ms
+        'max_batch_delay': 200,  # ms
+        'gamma': gamma,
+        'scc_ordering': 'alphabetical',
+        # Preserve the existing FairDAG DAS entry-point calculation.
+        'fault_threshold': int(math.floor((max(bench_params['nodes']) - 1) / k)),
     }
     try:
         Bench(ctx).run(bench_params, node_params, debug)

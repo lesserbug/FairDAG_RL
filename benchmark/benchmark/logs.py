@@ -23,7 +23,16 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, attack_type=10, arbitragers=1, faults=0):
+    def __init__(
+        self,
+        clients,
+        primaries,
+        workers,
+        attack_type=10,
+        arbitragers=1,
+        faults=0,
+        input_rate=None,
+    ):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
@@ -48,10 +57,17 @@ class LogParser:
         self.size, self.rate, self.start, misses, self.sent_samples \
             = zip(*results)
         self.misses = sum(misses)
+        self.input_rate = input_rate if input_rate is not None else sum(self.rate)
 
         self.all_sent_samples = {}
-        for d in self.sent_samples:
-            self.all_sent_samples.update(d)
+        for samples in self.sent_samples:
+            for tx_id, send_time in samples.items():
+                if tx_id in self.all_sent_samples:
+                    raise ParseError(
+                        f'Duplicate sample transaction id {tx_id} across clients; '
+                        'latency matching would be ambiguous'
+                    )
+                self.all_sent_samples[tx_id] = send_time
 
         # Parse the primaries logs.
         try:
@@ -81,6 +97,13 @@ class LogParser:
         self.all_received_samples = self._merge_dicts(self.received_samples)
 
         self.fair_ordered_txs = self._merge_results([x.items() for x in fair_ordered_txs_list])
+        if not self.fair_ordered_txs:
+            Print.warn(
+                'No FairDAG-RL final-order records found; final-order throughput '
+                'and latency will be zero'
+            )
+        elif not set(self.fair_ordered_txs).intersection(self.all_sent_samples):
+            Print.warn('No client sample transaction matched a FairDAG-RL final-order record')
 
         # Aggregate per-task CPU timings across all workers.
         # Each worker contributes its own list of samples per task name.
@@ -168,16 +191,20 @@ class LogParser:
     # ---- Log parsers ----
 
     def _parse_clients(self, log):
+        if search(r"(?:panicked|Error)", log) is not None:
+            raise ParseError('Client(s) panicked')
         size = int(search(r"Transactions size: (\d+)", log).group(1))
         rate = int(search(r"Transactions rate: (\d+)", log).group(1))
         tmp = search(r"\[(.*Z) .* Start ", log).group(1)
         start = _to_posix(tmp)
         misses = len(findall(r"rate too high", log))
-        tmp = findall(r"\[(.*Z) .* Sending transaction (\d+)", log)
+        tmp = findall(r"\[(.*Z) .* Sending sample transaction (\d+)", log)
         samples = {int(s): _to_posix(t) for t, s in tmp}
         return size, rate, start, misses, samples
 
     def _parse_primaries(self, log):
+        if search(r"(?:panicked|Error)", log) is not None:
+            raise ParseError('Primary(s) panicked')
         tmp = findall(r"\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)", log)
         tmp = [(d, _to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
@@ -213,6 +240,8 @@ class LogParser:
                 monitor_attacks, fissure_attacks, sluggish_attacks, speculative_attacks)
 
     def _parse_workers(self, log):
+        if search(r"(?:panicked|Error)", log) is not None:
+            raise ParseError('Worker(s) panicked')
         tmp = findall(r"Batch ([^ ]+) contains (\d+) B", log)
         sizes = {d: int(s) for d, s in tmp}
         tmp = findall(r"Batch ([^ ]+) contains tx (\d+)", log)
@@ -220,7 +249,9 @@ class LogParser:
         ip = search(r"booted on (\d+.\d+.\d+.\d+)", log).group(1)
 
         tmp = findall(r"\[(.*Z) .* FairDAG-RL ordered transaction: (\d+)", log)
-        fair_ordered_txs = {int(tx_id): _to_posix(t) for t, tx_id in tmp}
+        fair_ordered_txs = self._merge_results([
+            [(int(tx_id), _to_posix(t)) for t, tx_id in tmp]
+        ])
         # Position in log = protocol's final order (no timestamp needed)
         fair_ordered_seqs = {}
         for pos, (t, tx_id) in enumerate(tmp):
@@ -277,12 +308,13 @@ class LogParser:
         return committed_count, latencies
 
     def _consensus_throughput(self):
-        if not self.commits: return 0, 0, 0
+        if not self.commits or not self.proposals: return 0, 0, 0
         start = min(self.proposals.values()); end = max(self.commits.values())
         duration = end - start
         if duration <= 0: return 0, 0, 0
-        committed_count, _ = self._committed_tx_stats()
-        tps = committed_count / duration; bps = tps * self.size[0]
+        committed_bytes = sum(self.sizes[d] for d in self.commits if d in self.sizes)
+        bps = committed_bytes / duration
+        tps = bps / self.size[0]
         return tps, bps, duration
 
     def _consensus_latency(self):
@@ -292,11 +324,11 @@ class LogParser:
     # ---- FairDAG-RL metrics ----
 
     def _fairdag_tx_stats(self):
-        fair_count = 0; latencies = []
+        latencies = []
         for tx_id, fair_time in self.fair_ordered_txs.items():
             if tx_id not in self.all_sent_samples: continue
-            fair_count += 1; latencies.append(fair_time - self.all_sent_samples[tx_id])
-        return fair_count, latencies
+            latencies.append(fair_time - self.all_sent_samples[tx_id])
+        return len(self.fair_ordered_txs), latencies
 
     def _fairdag_throughput(self):
         if not self.fair_ordered_txs: return 0, 0, 0
@@ -325,6 +357,8 @@ class LogParser:
         return len(self.fair_graph_stats), mean(txs_per_graph) if txs_per_graph else 0, total_ordered
 
     def _end_to_end_throughput(self):
+        # Keep MRV's aggregation label, but this endpoint is FairDAG final-order
+        # completion (not Narwhal/Tusk commit or application execution/reply).
         if not self.fair_ordered_txs: return 0, 0, 0
         return self._fairdag_throughput()
     def _end_to_end_latency(self):
@@ -445,7 +479,7 @@ class LogParser:
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
         fairdag_overhead = self._fairdag_finalization_overhead() * 1_000
-        fairdag_count, _ = self._fairdag_tx_stats()
+        fairdag_count, fairdag_latencies = self._fairdag_tx_stats()
         num_graphs, avg_txs_per_graph, total_fair_ordered = self._fairdag_graph_summary()
         attack_print = ""
         ms, mt = self._attack_monitor_results(); fs, ft = self._fissure_attack_results()
@@ -476,7 +510,7 @@ class LogParser:
             f' Committee size: {self.committee_size} node(s)\n'
             f' Worker(s) per node: {self.workers} worker(s)\n'
             f' Collocate primary and workers: {self.collocate}\n'
-            f' Input rate: {sum(self.rate):,} tx/s\n'
+            f' Input rate: {self.input_rate:,} tx/s\n'
             f' Transaction size: {self.size[0]:,} B\n'
             f' Execution time: {round(duration):,} s\n\n'
             f' Header size: {header_size:,} B\n'
@@ -494,6 +528,7 @@ class LogParser:
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency samples: {len(fairdag_latencies):,}\n'
             f' Fair ordering overhead: {round(fairdag_overhead):,} ms\n'
             f' Fair-ordered txs: {fairdag_count:,}\n'
             f' Graphs finalized: {num_graphs:,}\n'
@@ -508,10 +543,25 @@ class LogParser:
         with open(filename, 'a') as f: f.write(self.result())
 
     @classmethod
-    def process(cls, directory, attack_type=10, arbitragers=1, faults=0):
+    def process(
+        cls,
+        directory,
+        attack_type=10,
+        arbitragers=1,
+        faults=0,
+        input_rate=None,
+    ):
         clients = [open(fn).read() for fn in sorted(glob(join(directory, "client-*.log")))]
         primaries = [open(fn).read() for fn in sorted(glob(join(directory, "primary-*.log")))]
         workers = [open(fn).read() for fn in sorted(glob(join(directory, "worker-*.log")))]
-        instance = cls(clients, primaries, workers, attack_type=attack_type, arbitragers=arbitragers, faults=faults)
+        instance = cls(
+            clients,
+            primaries,
+            workers,
+            attack_type=attack_type,
+            arbitragers=arbitragers,
+            faults=faults,
+            input_rate=input_rate,
+        )
         instance.logs_dir = directory
         return instance

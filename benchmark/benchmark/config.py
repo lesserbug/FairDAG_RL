@@ -64,6 +64,12 @@ class Committee:
         port = base_port
         self.json = {'authorities': OrderedDict()}
 
+        if attack_types is None:
+            # Rust's Authority schema requires this field. Remote honest-only
+            # benchmarks do not otherwise need an attack layout.
+            attack_types = [0] * len(addresses)
+        assert len(attack_types) == len(addresses)
+
         counter = 0
         for name, hosts in addresses.items():
             host = hosts.pop(0)
@@ -88,10 +94,7 @@ class Committee:
                 'workers': workers_addr
             }
 
-            if(
-                attack_types != None
-            ):
-                self.json['authorities'][name]["attack_type"] = attack_types[counter]
+            self.json['authorities'][name]["attack_type"] = attack_types[counter]
 
             counter += 1
 
@@ -356,6 +359,7 @@ class BenchParameters:
             self.tx_size = int(json['tx_size'])
            
             self.duration = int(json['duration'])
+            self.drain_duration = int(json.get('drain_duration', 0))
 
             self.runs = int(json['runs']) if 'runs' in json else 1
         except KeyError as e:
@@ -366,6 +370,9 @@ class BenchParameters:
 
         if min(self.nodes) <= self.faults:
             raise ConfigError('There should be more nodes than faults')
+
+        if self.drain_duration < 0:
+            raise ConfigError('Drain duration must be non-negative')
 
 
 class PlotParameters:

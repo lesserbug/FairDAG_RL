@@ -36,16 +36,30 @@ class LocalBench:
 
     def _kill_nodes(self):
         try:
-            cmd = CommandMaker.kill().split()
-            subprocess.run(cmd, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                CommandMaker.kill_nodes(),
+                shell=True,
+                stderr=subprocess.DEVNULL,
+            )
         except subprocess.SubprocessError as e:
             raise BenchError("Failed to kill testbed", e)
+
+    def _kill_clients(self):
+        try:
+            subprocess.run(
+                CommandMaker.kill_clients(),
+                shell=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.SubprocessError as e:
+            raise BenchError("Failed to kill clients", e)
 
     def run(self, debug=False):
         assert isinstance(debug, bool)
         Print.heading("Starting local benchmark")
 
         # Kill any previous testbed.
+        self._kill_clients()
         self._kill_nodes()
 
         try:
@@ -92,47 +106,24 @@ class LocalBench:
             workers_addresses = committee.workers_addresses(self.faults)
             rate_share = ceil(rate / committee.workers())
 
-            ### Default Narwhal Approach : 
-            # for i, addresses in enumerate(workers_addresses):
-            #     for id, address in addresses:
-            #         cmd = CommandMaker.run_client(
-            #             address,
-            #             self.tx_size,
-            #             rate_share,
-            #             [x for y in workers_addresses for _, x in y],
-            #         )
-            #         log_file = PathMaker.client_log_file(i, id)
-            #         self._background_run(cmd, log_file)
-
-            ### Giulio Approach : 
-            # current method has 1 client per worker, which means multiple clients per primary, but one primary per client
-            # we want 2f+1 primaries per client, so we can send to one worker of each primary
-            # assuming each node has the same amount of workers, we will spawn W*N clients and each of them communicates with N workers
-            clients_workers_addresses = (
-                []
-            )  # list of lists, contains addressess of each worker each client should connect to
-
-            # For each client, choose one worker id. communicate with all workers with that id
-            for c_id in range(committee.workers()):
-                worker_id = c_id % self.workers
-                workers = []
-                for addresses in workers_addresses:
-                    for w_id, w_address in addresses:
-                        if w_id == worker_id:
-                            workers.append(w_address)
-                            break
-                clients_workers_addresses.append((f"{worker_id}", workers))
-
-            for i, (id, worker_list) in enumerate(clients_workers_addresses):
-                addresses = ",".join(worker_list)
-                cmd = CommandMaker.run_client(
-                    addresses,
-                    self.tx_size,
-                    rate_share,
-                    [x for y in workers_addresses for _, x in y],
-                )
-                log_file = PathMaker.client_log_file(i, id)
-                self._background_run(cmd, log_file)
+            all_worker_addresses = [
+                address
+                for authority in workers_addresses
+                for _, address in authority
+            ]
+            client_id = 0
+            for i, addresses in enumerate(workers_addresses):
+                for id, address in addresses:
+                    cmd = CommandMaker.run_client(
+                        address,
+                        self.tx_size,
+                        rate_share,
+                        all_worker_addresses,
+                        client_id,
+                    )
+                    log_file = PathMaker.client_log_file(i, id)
+                    self._background_run(cmd, log_file)
+                    client_id += 1
 
             # Run the primaries (except the faulty ones).
             for i, address in enumerate(committee.primary_addresses(self.faults)):
@@ -163,6 +154,17 @@ class LocalBench:
             # Wait for all transactions to be processed.
             Print.info(f"Running benchmark ({self.duration} sec)...")
             sleep(self.duration)
+
+            Print.info(
+                f"Stopping clients and draining benchmark ({self.drain_duration} sec)..."
+            )
+            self._kill_clients()
+            if self.drain_duration > 0:
+                sleep(self.drain_duration)
+            else:
+                Print.warn(
+                    'drain_duration is 0; FairDAG final ordering may be right-censored'
+                )
             self._kill_nodes()
 
             # Parse logs and return the parser.
@@ -172,8 +174,10 @@ class LocalBench:
                 attack_type=attack_type,
                 arbitragers=arbitragers,
                 faults=self.faults,
+                input_rate=rate,
             )
 
         except (subprocess.SubprocessError, ParseError) as e:
+            self._kill_clients()
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
