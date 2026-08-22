@@ -11,7 +11,14 @@ from copy import deepcopy
 import subprocess
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
-from benchmark.utils import BenchError, Print, PathMaker, progress_bar
+from benchmark.utils import (
+    BenchError,
+    Print,
+    PathMaker,
+    progress_bar,
+    distribute_client_rates,
+    validate_crash_faults,
+)
 from benchmark.commands import CommandMaker
 from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
@@ -244,7 +251,13 @@ class Bench:
         # for the faulty nodes to be online).
         Print.info('Booting clients...')
         workers_addresses = committee.workers_addresses(faults)
-        rate_share = ceil(rate / committee.workers())
+        active_clients = sum(len(x) for x in workers_addresses)
+        client_rates = distribute_client_rates(rate, active_clients)
+        readiness_addresses = [
+            address
+            for authority in workers_addresses
+            for _, address in authority
+        ]
         client_id = 0
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
@@ -252,8 +265,8 @@ class Bench:
                 cmd = CommandMaker.run_client(
                     address,
                     bench_parameters.tx_size,
-                    rate_share,
-                    [x for y in workers_addresses for _, x in y],
+                    client_rates[client_id],
+                    readiness_addresses,
                     client_id,
                 )
                 log_file = PathMaker.client_log_file(i, id)
@@ -358,6 +371,21 @@ class Bench:
         except ConfigError as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
+        try:
+            validate_crash_faults(
+                bench_parameters.faults,
+                node_parameters.json['fault_threshold'],
+                bench_parameters.nodes,
+            )
+            for nodes in bench_parameters.nodes:
+                active_clients = (
+                    nodes - bench_parameters.faults
+                ) * bench_parameters.workers
+                for rate in bench_parameters.rate:
+                    distribute_client_rates(rate, active_clients)
+        except ValueError as e:
+            raise BenchError('Invalid remote benchmark configuration', e)
+
         # Select which hosts to use.
         selected_hosts = self._select_hosts(bench_parameters)
         if not selected_hosts:
@@ -399,11 +427,12 @@ class Bench:
                         faults = bench_parameters.faults
                         logger = self._logs(committee_copy, bench_parameters, r)
                         logger.print(PathMaker.result_file(
-                           bench_parameters.attack_type,
-    			   bench_parameters.arbitragers,
-     			   faults,
- 			   bench_parameters.workers,
-  			   n, 
+                            bench_parameters.attack_type,
+                            bench_parameters.arbitragers,
+                            faults,
+                            bench_parameters.workers,
+                            n,
+                            node_parameters.json['batch_size'],
                         ))
                     except (subprocess.SubprocessError, GroupException, ParseError) as e:
                         self.kill(hosts=selected_hosts)

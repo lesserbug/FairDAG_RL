@@ -504,13 +504,12 @@ def remote(ctx, debug=False):
         'faults': 0,
         'arbitragers': 0,
         'attack_type': 0,
-        'nodes': [20],
+        'nodes': [10],
         'workers': 1,
         'collocate': True,
-        # Run one point at a time so its raw logs can be archived before the
-        # next run replaces benchmark/logs. For 20 clients, use a multiple of
-        # 20 clients * 20 bursts/s to avoid integer rate truncation.
-        'rate': [800],
+        # Run one point at a time so its raw logs can be archived. The remote
+        # harness distributes this exact total in 20 tx/s client quanta.
+        'rate': [2_000],
         'tx_size': 512,
         'duration': 60,
         'drain_duration': 30,

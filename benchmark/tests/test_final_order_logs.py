@@ -5,6 +5,11 @@ from unittest.mock import patch
 from benchmark.commands import CommandMaker
 from benchmark.config import BenchParameters, Committee, ConfigError, NodeParameters
 from benchmark.logs import LogParser, ParseError, _to_posix
+from benchmark.utils import (
+    PathMaker,
+    distribute_client_rates,
+    validate_crash_faults,
+)
 
 
 def client_log(start, samples=(), misses=0):
@@ -141,6 +146,27 @@ class FinalOrderLogTests(unittest.TestCase):
 
 
 class BenchmarkConfigurationTests(unittest.TestCase):
+    def test_fault_runs_preserve_the_exact_total_offered_rate(self):
+        for active_clients in (10, 9, 8):
+            rates = distribute_client_rates(3_000, active_clients)
+            self.assertEqual(sum(rates), 3_000)
+            self.assertEqual(len(rates), active_clients)
+            self.assertTrue(all(rate % 20 == 0 for rate in rates))
+            self.assertLessEqual(max(rates) - min(rates), 20)
+
+    def test_client_rate_distribution_rejects_fractional_bursts(self):
+        with self.assertRaisesRegex(ValueError, 'positive multiple of 20'):
+            distribute_client_rates(3_001, 9)
+
+    def test_crashes_above_the_configured_threshold_are_rejected(self):
+        validate_crash_faults(2, 2, [10])
+        with self.assertRaisesRegex(ValueError, 'Crash faults=3'):
+            validate_crash_faults(3, 2, [10])
+
+    def test_remote_result_identity_includes_batch_size(self):
+        filename = PathMaker.result_file(0, 0, 1, 1, 10, 51_200)
+        self.assertTrue(filename.endswith('remote-0-0-1-1-10-b51200.txt'))
+
     def test_drain_duration_defaults_to_zero_and_rejects_negative_values(self):
         base = {
             'faults': 0,

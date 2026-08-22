@@ -2,6 +2,40 @@
 from os.path import join, dirname, abspath
 import traceback
 
+
+CLIENT_RATE_PRECISION = 20
+
+
+def distribute_client_rates(total_rate, active_clients):
+    """Split an exact total rate into rates supported by the 20 Hz Rust client."""
+    if active_clients <= 0:
+        raise ValueError('There must be at least one active benchmark client')
+    if total_rate <= 0 or total_rate % CLIENT_RATE_PRECISION != 0:
+        raise ValueError(
+            f'Input rate {total_rate} must be a positive multiple of '
+            f'{CLIENT_RATE_PRECISION} tx/s'
+        )
+
+    total_bursts = total_rate // CLIENT_RATE_PRECISION
+    base_bursts, remainder = divmod(total_bursts, active_clients)
+    rates = [
+        (base_bursts + (1 if i < remainder else 0))
+        * CLIENT_RATE_PRECISION
+        for i in range(active_clients)
+    ]
+    assert sum(rates) == total_rate
+    return rates
+
+
+def validate_crash_faults(faults, fault_threshold, nodes):
+    """Reject crash-at-start configurations that cannot reach FairDAG quorum."""
+    if faults > fault_threshold:
+        raise ValueError(
+            f'Crash faults={faults} exceed the configured FairDAG-RL '
+            f'threshold {fault_threshold} for nodes={nodes}'
+        )
+
+
 class BenchError(Exception):
     def __init__(self, message, error=None):
         assert isinstance(error, Exception)
@@ -105,11 +139,13 @@ class PathMaker:
 
     @staticmethod
     def result_file(
-        attack_type, arbitragers, faults, workers, nodes
+        attack_type, arbitragers, faults, workers, nodes, batch_size=None
     ):
+        batch_suffix = '' if batch_size is None else f'-b{batch_size}'
         return join(
             PathMaker.results_path(),
-            f"remote-{attack_type}-{arbitragers}-{faults}-{workers}-{nodes}.txt",
+            f"remote-{attack_type}-{arbitragers}-{faults}-{workers}-{nodes}"
+            f"{batch_suffix}.txt",
         )
 
     @staticmethod
